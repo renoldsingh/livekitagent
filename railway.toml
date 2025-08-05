@@ -2,21 +2,20 @@
 # Use Nixpacks (recommended by Railway) to build the project
 builder = "nixpacks"
 # Install dependencies using uv (project includes uv.lock). Adjust as needed.
-# Replace with your actual build steps if different.
-buildCommand = "echo building! && uv sync --frozen"
+# Reproducible builds via the lockfile.
+buildCommand = "uv sync --frozen"
 
 [deploy]
-# Optional pre-deploy steps (e.g., migrations). Update or remove as needed.
-preDeployCommand = ["echo pre-deploy steps"]
+# Download runtime plugin/model files on deploy so the worker is ready after start.
+# Note: If these files are large and your filesystem is ephemeral, this will re-run on each deploy.
+preDeployCommand = ["uv run python -m src.agent download-files"]
 
-# Start command for your Python app. Update to your actual entrypoint.
-# Example for ASGI app with uvicorn (uncomment and adjust if applicable):
-# startCommand = "uv run uvicorn src.agent:app --host 0.0.0.0 --port $PORT"
-startCommand = "uv run python -m src.agent"
+# Start the worker in production mode, matching README usage:
+# "uv run python src/agent.py start" or "python -m src.agent start"
+startCommand = "uv run python -m src.agent start"
 
-# Healthcheck settings (update path to your app’s health endpoint)
-healthcheckPath = "/"
-healthcheckTimeout = 100
-
-# Restart policy: "always" | "on_failure" | "never"
+# No HTTP server is declared in README; treat as worker process.
+# Remove HTTP healthcheck to avoid failing probes.
+# If you later expose HTTP, add healthcheckPath and bind to $PORT.
+# restartPolicy options: "always" | "on_failure" | "never"
 restartPolicyType = "on_failure"
