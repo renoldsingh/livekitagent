@@ -3,7 +3,8 @@ import aiohttp
 import os
 import json
 import asyncio
-from datetime import datetime
+import jwt
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 from dotenv import load_dotenv
@@ -34,18 +35,51 @@ job_usage_data = defaultdict(lambda: {
     "participant_info": {},
     "job_start_time": None,
     "usage_metrics": [],
-    "current_session": None
+    "current_session": None,
+    "primary_participant_id": None,
+    "participant_metadata": None  # Add this to store metadata
 })
+
+
+def create_jwt_token(participant_id: str) -> str:
+    """Create JWT token with participant_id as user_id in payload."""
+    try:
+        jwt_secret = os.getenv("LIVEKIT_API_JWT")
+        if not jwt_secret:
+            logger.error("JWT_SECRET not found in environment variables")
+            return None
+        
+        # Current time
+        now = datetime.utcnow()
+        
+        # Token payload with 1 minute expiration
+        payload = {
+            "user_id": participant_id,
+            "iat": now,  # issued at
+            "exp": now + timedelta(minutes=1)  # expires in 1 minute
+        }
+        
+        # Create JWT token
+        token = jwt.encode(payload, jwt_secret, algorithm="HS256")
+        
+        logger.info(f"Created JWT token for participant: {participant_id}")
+        return token
+        
+    except Exception as e:
+        logger.error(f"Error creating JWT token: {str(e)}")
+        return None
 
 
 class Assistant(Agent):
     def __init__(self) -> None:
-        super().__init__(
-            instructions="""You are a helpful voice AI assistant.
+        # Get instructions from environment variable
+        instructions = os.getenv("ASSISTANT_INSTRUCTIONS", 
+            """You are a helpful voice AI assistant.
             You eagerly assist users with their questions by providing information from your extensive knowledge.
             Your responses are concise, to the point, and without any complex formatting or punctuation.
-            You are curious, friendly, and have a sense of humor.""",
-        )
+            You are curious, friendly, and have a sense of humor.""")
+        
+        super().__init__(instructions=instructions)
 
     @function_tool
     async def lookup_weather(self, context: RunContext, location: str):
@@ -61,55 +95,132 @@ class Assistant(Agent):
 
 
 async def send_participant_job_mapping(participant_data: dict):
-    """Send participant-job mapping to server for tracking."""
+    """Send participant-job mapping to server for tracking with JWT authentication."""
     try:
-        # server_url = os.getenv("PARTICIPANT_JOB_SERVER_URL")
-        # if not server_url:
-        #     logger.warning("PARTICIPANT_JOB_SERVER_URL not configured, skipping participant mapping upload")
-        #     return
+        server_url = os.getenv("PARTICIPANT_JOB_SERVER_URL")
+        if not server_url:
+            logger.warning("PARTICIPANT_JOB_SERVER_URL not configured, skipping participant mapping upload")
+            return False
+        
+        participant_id = participant_data.get("participant_id")
+        if not participant_id:
+            logger.error("No participant_id found in participant_data")
+            return False
+        
+        # Create JWT token
+        jwt_token = create_jwt_token(participant_id)
+        if not jwt_token:
+            logger.error("Failed to create JWT token, skipping API call")
+            return False
         
         participant_data["timestamp"] = datetime.utcnow().isoformat()
 
-        logger.error(f"Sending participant-job mapping: {participant_data}") 
-        # async with aiohttp.ClientSession() as session:
-        #     async with session.post(
-        #         server_url,
-        #         json=participant_data,
-        #         headers={"Content-Type": "application/json"}
-        #     ) as response:
-        #         if response.status == 200:
-        #             logger.info(f"Participant-job mapping sent successfully: {participant_data['participant_id']} -> {participant_data['job_id']}")
-        #         else:
-        #             logger.warning(f"Failed to send participant-job mapping: {response.status}")
+        logger.info(f"Sending participant-job mapping with JWT: {participant_data}") 
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {jwt_token}"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                server_url,
+                json=participant_data,
+                headers=headers
+            ) as response:
+                if response.status == 200:
+                    logger.info(f"Participant-job mapping sent successfully: {participant_data['participant_id']} -> {participant_data['job_id']}")
+                    return True
+                else:
+                    logger.warning(f"Failed to send participant-job mapping: {response.status}")
+                    # Log response body for debugging
+                    try:
+                        response_text = await response.text()
+                        logger.warning(f"Response body: {response_text}")
+                    except:
+                        pass
+                    return False
                     
     except Exception as e:
         logger.error(f"Error sending participant-job mapping: {str(e)}")
+        return False
 
 
-async def send_job_usage_to_server(job_usage: dict):
-    """Send job usage data to server."""
+async def send_job_usage_to_server(job_usage: dict, job_id: str):
+    """Send job usage data to server with JWT authentication and flush data if successful."""
     try:
-        # server_url = os.getenv("JOB_USAGE_SERVER_URL")
-        # if not server_url:
-        #     logger.warning("JOB_USAGE_SERVER_URL not configured, skipping job usage upload")
-        #     return
+        server_url = os.getenv("JOB_USAGE_SERVER_URL")
+        if not server_url:
+            logger.warning("JOB_USAGE_SERVER_URL not configured, skipping job usage upload")
+            return False
+        
+        # Get participant_id from multiple sources
+        participant_id = None
+        
+        # First try to get from participant_info
+        if "participant_info" in job_usage and job_usage["participant_info"]:
+            participant_id = job_usage["participant_info"].get("participant_id")
+        
+        # If not found, try from primary_participant_id
+        if not participant_id:
+            participant_id = job_usage.get("primary_participant_id")
+        
+        # If still not found, try from job_usage_data global store
+        if not participant_id and job_id in job_usage_data:
+            participant_id = job_usage_data[job_id].get("primary_participant_id")
+            # Also try participant_info in global store
+            if not participant_id and job_usage_data[job_id].get("participant_info"):
+                participant_id = job_usage_data[job_id]["participant_info"].get("participant_id")
+        
+        if not participant_id:
+            logger.error(f"No participant_id found in job usage data for job {job_id}")
+            logger.error(f"Job usage data keys: {list(job_usage.keys())}")
+            logger.error(f"Participant info: {job_usage.get('participant_info', {})}")
+            return False
+        
+        # Create JWT token
+        jwt_token = create_jwt_token(participant_id)
+        if not jwt_token:
+            logger.error("Failed to create JWT token, skipping API call")
+            return False
         
         job_usage["timestamp"] = datetime.utcnow().isoformat()
         
-        logger.error(f"Sending job usage data: {job_usage}")
-        # async with aiohttp.ClientSession() as session:
-        #     async with session.post(
-        #         server_url,
-        #         json=job_usage,
-        #         headers={"Content-Type": "application/json"}
-        #     ) as response:
-        #         if response.status == 200:
-        #             logger.info(f"Job usage data sent successfully for job: {job_usage.get('job_id')}")
-        #         else:
-        #             logger.warning(f"Failed to send job usage data: {response.status}")
+        logger.info(f"Sending job usage data with JWT for participant {participant_id}: {job_usage}")
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {jwt_token}"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                server_url,
+                json=job_usage,
+                headers=headers
+            ) as response:
+                if response.status == 200:
+                    logger.info(f"Job usage data sent successfully for job: {job_usage.get('job_id')}")
+                    
+                    # Flush data if status is 200
+                    if job_id in job_usage_data:
+                        logger.info(f"Flushing job usage data for job: {job_id}")
+                        del job_usage_data[job_id]
+                    
+                    return True
+                else:
+                    logger.warning(f"Failed to send job usage data: {response.status}")
+                    # Log response body for debugging
+                    try:
+                        response_text = await response.text()
+                        logger.warning(f"Response body: {response_text}")
+                    except:
+                        pass
+                    return False
                     
     except Exception as e:
         logger.error(f"Error sending job usage data: {str(e)}")
+        return False
 
 
 def prewarm(proc: JobProcess):
@@ -139,11 +250,16 @@ async def entrypoint(ctx: JobContext):
     for participant_id, participant in ctx.room.remote_participants.items():
         logger.info(f"Existing participant: {participant_id} - {participant.identity}")
 
-    # Set up a voice AI pipeline
+    # Get models from environment variables
+    llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    stt_model = os.getenv("STT_MODEL", "nova-3")
+    tts_voice = os.getenv("TTS_VOICE", "6f84f4b8-58a2-430c-8c79-688dad597532")
+
+    # Set up a voice AI pipeline with environment variables
     session = AgentSession(
-        llm=openai.LLM(model="gpt-4o-mini"),
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        tts=cartesia.TTS(voice="6f84f4b8-58a2-430c-8c79-688dad597532"),
+        llm=openai.LLM(model=llm_model),
+        stt=deepgram.STT(model=stt_model, language="multi"),
+        tts=cartesia.TTS(voice=tts_voice),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
     )
@@ -166,32 +282,37 @@ async def entrypoint(ctx: JobContext):
     async def handle_participant_connected(participant):
         logger.info(f"PARTICIPANT CONNECTED EVENT: {participant.identity} -> Job: {job_id}")
         logger.info(f"Participant details - Name: {participant.name}, Kind: {getattr(participant, 'kind', 'unknown')}")
+        logger.info(f"Participant metadata: {participant.metadata}")
         
         # Map participant to job
         participant_job_mapping[participant.identity] = job_id
         
+        # Set primary participant ID and metadata for this job
+        job_usage_data[job_id]["primary_participant_id"] = participant.identity
+        job_usage_data[job_id]["participant_metadata"] = participant.metadata
+        
         # Get session details
         session_details = {
-            "model": getattr(session.llm, 'model', None),
-            "stt_model": getattr(session.stt, 'model', None),
-            "tts_voice": getattr(session.tts, 'voice', None),
+            "llm_model": llm_model,
+            "stt_model": stt_model,
+            "tts_voice": tts_voice,
         }
         
         logger.info(f"Session details for participant {participant.identity}: {session_details}")
         
-        # Store participant info in job usage data
+        # Store comprehensive participant info in job usage data
         job_usage_data[job_id]["participant_info"] = {
             "participant_id": participant.identity,
             "participant_name": participant.name,
             "participant_metadata": participant.metadata,
             "participant_kind": str(participant.kind) if hasattr(participant, 'kind') else None,
             "join_time": datetime.utcnow().isoformat(),
-            "session_details": session_details  # Add session details here
+            "session_details": session_details
         }
         
         # Send participant-job mapping to server
         mapping_data = {
-            "event_type": "participant_job_mapping",
+            "event_type": "PARTICIPANT_CONNECTED",
             "participant_id": participant.identity,
             "participant_name": participant.name,
             "job_id": job_id,
@@ -201,26 +322,47 @@ async def entrypoint(ctx: JobContext):
             "session_details": session_details  # Add session details here too
         }
             
-        # Send and flush
+        # Send and flush if successful
         success = await send_participant_job_mapping(mapping_data)
 
-        # Clean up the detailed data after sending, keep only essential info
+        # Clean up the detailed data after sending, but keep essential info including participant_id and metadata
         if success:
-            # Keep minimal info for disconnect tracking
+            # Keep essential info for disconnect tracking and JWT token generation
             job_usage_data[job_id]["participant_info"] = {
                 "participant_id": participant.identity,
+                "participant_name": participant.name,
+                "participant_metadata": participant.metadata,
                 "join_time": datetime.utcnow().isoformat()
             }
             logger.info(f"Flushed detailed participant data for {participant.identity}")
 
 
-    async def handle_participant_disconnected(participant):
+    async def handle_participant_disconnected(participant, reason=None):
         logger.info(f"PARTICIPANT DISCONNECTED EVENT: {participant.identity}")
+        
+        # Get disconnect reason
+        disconnect_reason = reason if reason else "unknown"
+        if hasattr(participant, 'disconnect_reason'):
+            disconnect_reason = participant.disconnect_reason
+        elif hasattr(participant, 'metadata') and participant.metadata:
+            # Try to extract reason from metadata if available
+            try:
+                metadata = json.loads(participant.metadata) if isinstance(participant.metadata, str) else participant.metadata
+                disconnect_reason = metadata.get('disconnect_reason', disconnect_reason)
+            except:
+                pass
+        
+        logger.info(f"Disconnect reason for {participant.identity}: {disconnect_reason}")
         
         # Update leave time if this participant was tracked
         if job_id in job_usage_data and "participant_info" in job_usage_data[job_id]:
             if job_usage_data[job_id]["participant_info"].get("participant_id") == participant.identity:
                 job_usage_data[job_id]["participant_info"]["leave_time"] = datetime.utcnow().isoformat()
+                job_usage_data[job_id]["participant_info"]["disconnect_reason"] = disconnect_reason
+                
+                # Ensure metadata is still preserved
+                if not job_usage_data[job_id]["participant_info"].get("participant_metadata"):
+                    job_usage_data[job_id]["participant_info"]["participant_metadata"] = participant.metadata
                 
                 # Calculate session duration
                 join_time_str = job_usage_data[job_id]["participant_info"].get("join_time")
@@ -234,37 +376,37 @@ async def entrypoint(ctx: JobContext):
 
         # Send disconnect notification
         disconnect_data = {
-            "event_type": "participant_disconnected",
+            "event_type": "PARTICIPANT_DISCONNECTED",
             "participant_id": participant.identity,
+            "participant_name": participant.name,
+            "participant_metadata": participant.metadata,
             "job_id": participant_job_mapping.get(participant.identity, job_id),
             "room_id": ctx.room.name,
-            "disconnect_time": datetime.utcnow().isoformat()
+            "disconnect_time": datetime.utcnow().isoformat(),
+            "disconnect_reason": disconnect_reason
         }
             
-        # Send and flush
+        # Send and flush if successful
         success = await send_participant_job_mapping(disconnect_data)
         
-        # Clean up all participant data after disconnect
+        # Clean up participant mapping but keep participant data including metadata for final usage report
         if success:
             # Remove from participant mapping
             participant_job_mapping.pop(participant.identity, None)
             
-            # Clear participant info from job data
-            if job_id in job_usage_data:
-                job_usage_data[job_id]["participant_info"] = {}
-            
-            logger.info(f"Flushed all data for disconnected participant {participant.identity}")
+            # DON'T clear participant info from job data yet - keep it for final usage report including metadata
+            logger.info(f"Participant {participant.identity} disconnected but keeping data including metadata for final usage report")
 
-    # Try multiple event names to catch participant events
+    # Event handlers with reason parameter for disconnection
     @ctx.room.on("participant_connected")
     def _on_participant_connected(participant):
         logger.info(f"Event: participant_connected triggered for {participant.identity}")
         asyncio.create_task(handle_participant_connected(participant))
 
     @ctx.room.on("participant_disconnected") 
-    def _on_participant_disconnected(participant):
+    def _on_participant_disconnected(participant, reason=None):
         logger.info(f"Event: participant_disconnected triggered for {participant.identity}")
-        asyncio.create_task(handle_participant_disconnected(participant))
+        asyncio.create_task(handle_participant_disconnected(participant, reason))
 
     # Also try alternative event names
     @ctx.room.on("remote_participant_connected")
@@ -273,9 +415,9 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(handle_participant_connected(participant))
 
     @ctx.room.on("remote_participant_disconnected")
-    def _on_remote_participant_disconnected(participant):
+    def _on_remote_participant_disconnected(participant, reason=None):
         logger.info(f"Event: remote_participant_disconnected triggered for {participant.identity}")
-        asyncio.create_task(handle_participant_disconnected(participant))
+        asyncio.create_task(handle_participant_disconnected(participant, reason))
 
     # Also try participant_joined/left
     @ctx.room.on("participant_joined")
@@ -284,9 +426,9 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(handle_participant_connected(participant))
 
     @ctx.room.on("participant_left")
-    def _on_participant_left(participant):
+    def _on_participant_left(participant, reason=None):
         logger.info(f"Event: participant_left triggered for {participant.identity}")
-        asyncio.create_task(handle_participant_disconnected(participant))
+        asyncio.create_task(handle_participant_disconnected(participant, reason))
 
     # Generic room event logging to see what events are available
     def log_room_event(event_name):
@@ -324,13 +466,30 @@ async def entrypoint(ctx: JobContext):
             job_duration = (end_time - start_time).total_seconds()
             job_usage_data[job_id]["job_duration_seconds"] = job_duration
 
-        # Send final job usage to server
+        # Ensure we have participant info and metadata for final usage report
+        if not job_usage_data[job_id].get("primary_participant_id"):
+            logger.warning(f"No primary_participant_id found for job {job_id}, trying to extract from other sources")
+            # Try to get from participant_info
+            if job_usage_data[job_id].get("participant_info", {}).get("participant_id"):
+                job_usage_data[job_id]["primary_participant_id"] = job_usage_data[job_id]["participant_info"]["participant_id"]
+        
+        # Ensure metadata is included at the top level for usage report
+        if not job_usage_data[job_id].get("participant_metadata"):
+            # Try to get from participant_info
+            if job_usage_data[job_id].get("participant_info", {}).get("participant_metadata"):
+                job_usage_data[job_id]["participant_metadata"] = job_usage_data[job_id]["participant_info"]["participant_metadata"]
+
+        # Log what metadata we're sending
+        metadata_to_send = job_usage_data[job_id].get("participant_metadata")
+        logger.info(f"Sending usage data with participant metadata: {metadata_to_send}")
+
+        # Send final job usage to server and flush if successful
         final_job_usage = {
-            "event_type": "job_completed",
+            "event_type": "PARTICIPANT_USAGE",
             **job_usage_data[job_id]
         }
         
-        await send_job_usage_to_server(final_job_usage)
+        await send_job_usage_to_server(final_job_usage, job_id)
 
     ctx.add_shutdown_callback(log_usage)
 
